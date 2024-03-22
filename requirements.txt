@@ -16,3 +16,4 @@ cachetools
 cryptography==3.4.*
 tb-mqtt-client>=1.9.0
 service-identity
+jpype1
