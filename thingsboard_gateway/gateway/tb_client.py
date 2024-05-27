@@ -32,7 +32,7 @@ except ImportError:
     from tb_gateway_mqtt import TBGatewayMqttClient, TBDeviceMqttClient
 
 import tb_device_mqtt
-tb_device_mqtt.DEFAULT_TIMEOUT = 1
+tb_device_mqtt.DEFAULT_TIMEOUT = 3
 
 class TBClient(threading.Thread):
     def __init__(self, config, config_folder_path, logger):
@@ -265,7 +265,7 @@ class TBClient(threading.Thread):
                         self.client.connect(keepalive=keep_alive,
                                             min_reconnect_delay=self.__min_reconnect_delay)
                     except ConnectionRefusedError:
-                        pass
+                        self.__logger.error("Connection refused. Check ThingsBoard is running.")
                     except Exception as e:
                         self.__logger.exception(e)
                 sleep(1)

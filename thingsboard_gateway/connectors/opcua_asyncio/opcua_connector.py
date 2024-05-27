@@ -46,6 +46,12 @@ SECURITY_POLICIES = {
     "Basic256Sha256": SecurityPolicyBasic256Sha256,
 }
 
+MESSAGE_SECURITY_MODES = {
+    "None": asyncua.ua.MessageSecurityMode.None_,
+    "Sign": asyncua.ua.MessageSecurityMode.Sign,
+    "SignAndEncrypt": asyncua.ua.MessageSecurityMode.SignAndEncrypt
+}
+
 
 class OpcUaConnectorAsyncIO(Connector, Thread):
     def __init__(self, gateway, config, connector_type):
@@ -58,7 +64,8 @@ class OpcUaConnectorAsyncIO(Connector, Thread):
         self.__id = self.__config.get('id')
         self.__server_conf = config['server']
         self.name = self.__config.get("name", 'OPC-UA Connector ' + ''.join(choice(ascii_lowercase) for _ in range(5)))
-        self.__log = init_logger(self.__gateway, self.name, self.__config.get('logLevel', 'INFO'))
+        self.__log = init_logger(self.__gateway, self.name, self.__config.get('logLevel', 'INFO'),
+                                 enable_remote_logging=self.__config.get('enableRemoteLogging', False))
 
         if "opc.tcp" not in self.__server_conf.get("url"):
             self.__opcua_url = "opc.tcp://" + self.__server_conf.get("url")
@@ -97,7 +104,7 @@ class OpcUaConnectorAsyncIO(Connector, Thread):
         self.__stopped = True
         self.__connected = False
         self.__log.info('%s has been stopped.', self.get_name())
-        self.__log.reset()
+        self.__log.stop()
 
     async def __reset_node(self, node):
         node['valid'] = False
@@ -185,6 +192,7 @@ class OpcUaConnectorAsyncIO(Connector, Thread):
             finally:
                 await self.__reset_nodes()
                 self.__connected = False
+                await asyncio.sleep(1)
 
     async def __set_auth_settings_by_cert(self):
         try:
@@ -192,6 +200,7 @@ class OpcUaConnectorAsyncIO(Connector, Thread):
             private_key = self.__server_conf["identity"].get("privateKey")
             cert = self.__server_conf["identity"].get("cert")
             policy = self.__server_conf["security"]
+            mode = self.__server_conf["identity"].get("mode", "SignAndEncrypt")
 
             if cert is None or private_key is None:
                 self.__log.exception("Error in ssl configuration - cert or privateKey parameter not found")
@@ -201,7 +210,8 @@ class OpcUaConnectorAsyncIO(Connector, Thread):
                 SECURITY_POLICIES[policy],
                 certificate=cert,
                 private_key=private_key,
-                server_certificate=ca_cert
+                server_certificate=ca_cert,
+                mode=MESSAGE_SECURITY_MODES[mode]
             )
         except Exception as e:
             self.__log.exception(e)

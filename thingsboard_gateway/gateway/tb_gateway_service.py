@@ -26,7 +26,7 @@ from signal import signal, SIGINT
 from string import ascii_lowercase, hexdigits
 from sys import argv, executable, getsizeof
 from threading import RLock, Thread, main_thread, current_thread
-from time import sleep, time
+from time import sleep, time, monotonic
 
 from simplejson import JSONDecodeError, dumps, load, loads
 from yaml import safe_load
@@ -67,7 +67,7 @@ main_handler = logging.handlers.MemoryHandler(-1)
 DEFAULT_CONNECTORS = {
     "mqtt": "MqttConnector",
     "modbus": "ModbusConnector",
-    "opcua": "OpcUaConnector",
+    "opcua": "OpcUaConnectorAsyncIO",
     "opcua_asyncio": "OpcUaConnectorAsyncIO",
     "ble": "BLEConnector",
     "request": "RequestConnector",
@@ -533,10 +533,15 @@ class TBGatewayService:
     def __close_connectors(self):
         for current_connector in self.available_connectors_by_id:
             try:
-                self.available_connectors_by_id[current_connector].close()
+                close_start = monotonic()
+                while not self.available_connectors_by_id[current_connector].is_stopped():
+                    self.available_connectors_by_id[current_connector].close()
+                    if monotonic() - close_start > 5:
+                        log.error("Connector %s close timeout", current_connector)
+                        break
                 log.debug("Connector %s closed connection.", current_connector)
             except Exception as e:
-                log.exception(e)
+                log.exception("Error while closing connector %s", current_connector, exc_info=e)
 
     def __stop_gateway(self):
         self.stopped = True
@@ -762,6 +767,11 @@ class TBGatewayService:
                 try:
                     connector_persistent_key = None
                     connector_type = connector["type"].lower() if connector.get("type") is not None else None
+
+                    # can be removed in future releases
+                    if connector_type == 'opcua':
+                        connector_type = 'opcua_asyncio'
+
                     if connector_type is None:
                         log.error("Connector type is not defined!")
                         continue
@@ -888,7 +898,7 @@ class TBGatewayService:
                             except Exception as e:
                                 log.error("[%r] Error on loading connector %r: %r", connector_id, connector_name, e)
                                 log.exception(e, attr_name=connector_name)
-                                if connector is not None:
+                                if connector is not None and not connector.is_stopped():
                                     connector.close()
                     else:
                         self.__grpc_connectors.update({connector_config['grpc_key']: connector_config})
@@ -1410,16 +1420,16 @@ class TBGatewayService:
 
     def add_device(self, device_name, content, device_type=None):
         device_type = device_type if device_type is not None else 'default'
+        self.__connected_devices[device_name] = {**content, DEVICE_TYPE_PARAMETER: device_type}
+        self.__saved_devices[device_name] = {**content, DEVICE_TYPE_PARAMETER: device_type}
+        self.__save_persistent_devices()
+        self.tb_client.client.gw_connect_device(device_name, device_type)
         device_details = None
         if device_name in self.__saved_devices:
             device_details = {
                 'connectorType': content['connector'].get_type(),
                 'connectorName': content['connector'].get_name()
             }
-        self.__connected_devices[device_name] = {**content, DEVICE_TYPE_PARAMETER: device_type}
-        self.__saved_devices[device_name] = {**content, DEVICE_TYPE_PARAMETER: device_type}
-        self.__save_persistent_devices()
-        self.tb_client.client.gw_connect_device(device_name, device_type)
         if device_details is not None:
             self.tb_client.client.gw_send_attributes(device_name, device_details)
 
@@ -1432,6 +1442,11 @@ class TBGatewayService:
         self.__connected_devices[device_name][event] = content
         if should_save:
             self.__save_persistent_devices()
+            self.send_to_storage(connector_name=content.get_name(),
+                                 connector_id=content.get_id(),
+                                 data={"deviceName": device_name,
+                                       "deviceType": self.__connected_devices[device_name][DEVICE_TYPE_PARAMETER],
+                                       "attributes": [{"connectorName": content.name}]})
 
     def del_device_async(self, data):
         if data['deviceName'] in self.__saved_devices:

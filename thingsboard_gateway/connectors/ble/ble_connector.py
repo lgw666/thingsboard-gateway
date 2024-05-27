@@ -45,7 +45,8 @@ class BLEConnector(Connector, Thread):
         self.__config = config
         self.__id = self.__config.get('id')
         self.name = self.__config.get("name", 'BLE Connector ' + ''.join(choice(ascii_lowercase) for _ in range(5)))
-        self.__log = init_logger(self.__gateway, self.name, self.__config.get('logLevel', 'INFO'))
+        self.__log = init_logger(self.__gateway, self.name, self.__config.get('logLevel', 'INFO'),
+                                 enable_remote_logging=self.__config.get('enableRemoteLogging', False))
 
         self.daemon = True
 
@@ -96,9 +97,16 @@ class BLEConnector(Connector, Thread):
         thread.start()
 
     def close(self):
+        self.__connected = False
         self.__stopped = True
+
+        for device in self.__devices:
+            device.stop()
+
+        self.__devices = []
+
         self.__log.info('%s has been stopped.', self.get_name())
-        self.__log.reset()
+        self.__log.stop()
 
     def get_name(self):
         return self.name

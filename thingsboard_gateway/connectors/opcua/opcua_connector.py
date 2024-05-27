@@ -57,8 +57,11 @@ class OpcUaConnector(Thread, Connector):
         self._config = config
         self.__id = self._config.get('id')
         self.__server_conf = config.get("server")
-        self.name = self._config.get("name", 'OPC-UA ' + ''.join(choice(ascii_lowercase) for _ in range(5)) + " Connector")
-        self._log = init_logger(self.__gateway, self.name, self._config.get('logLevel', 'INFO'))
+        self.name = self._config.get("name",
+                                     'OPC-UA ' + ''.join(choice(ascii_lowercase) for _ in range(5)) + " Connector")
+        self._log = init_logger(self.__gateway, self.name, self._config.get('logLevel', 'INFO'),
+                                enable_remote_logging=self._config.get('enableRemoteLogging', False))
+        self._log.warning("OPC-UA Connector is deprecated and will be removed in the release v.4.0")
         self.__interest_nodes = []
         self.__available_object_resources = {}
         self.__show_map = self.__server_conf.get("showMap", False)
@@ -241,7 +244,7 @@ class OpcUaConnector(Thread, Connector):
                 pass
         self.__connected = False
         self._log.info('%s has been stopped.', self.get_name())
-        self._log.reset()
+        self._log.stop()
 
     def get_id(self):
         return self.__id

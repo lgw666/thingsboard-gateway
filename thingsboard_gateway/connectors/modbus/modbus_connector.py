@@ -115,7 +115,8 @@ class ModbusConnector(Connector, Thread):
         self.__gateway = gateway
         self._connector_type = connector_type
         self.__log = init_logger(self.__gateway, config.get('name', self.name),
-                                 config.get('logLevel', 'INFO'))
+                                 config.get('logLevel', 'INFO'),
+                                 enable_remote_logging=config.get('enableRemoteLogging', False))
         self.__backward_compatibility_adapter = BackwardCompatibilityAdapter(config, gateway.get_config_path(),
                                                                              logger=self.__log)
         self.__config = self.__backward_compatibility_adapter.convert()
@@ -331,7 +332,10 @@ class ModbusConnector(Connector, Thread):
             slave.close()
 
         if self.__slave_thread is not None:
-            ServerStop()
+            try:
+                ServerStop()
+            except AttributeError:
+                self.__slave_thread.join()
 
         # Stop all workers
         for worker in self.__workers_thread_pool:
@@ -339,7 +343,7 @@ class ModbusConnector(Connector, Thread):
 
         # self.__slave_thread.join()
         self.__log.info('%s has been stopped.', self.get_name())
-        self.__log.reset()
+        self.__log.stop()
         self.__stopping = False
 
     def get_name(self):

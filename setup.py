@@ -17,15 +17,14 @@
 from setuptools import setup
 from os import path
 
+from thingsboard_gateway import version
 
 current_directory = path.abspath(path.dirname(__file__))
 with open(path.join(current_directory, 'README.md'), encoding='utf-8') as f:
     long_description = f.read()
 
-VERSION = "3.4.5"
-
 setup(
-    version=VERSION,
+    version=version.VERSION,
     name="thingsboard-gateway",
     author="ThingsBoard",
     author_email="info@thingsboard.io",
@@ -69,11 +68,11 @@ setup(
         'grpcio==1.58.0',
         'protobuf',
         'cachetools',
-        'tb-mqtt-client>=1.5',
+        'tb-mqtt-client>=1.9.1',
         'packaging==23.1',
         'service-identity'
     ],
-    download_url='https://github.com/thingsboard/thingsboard-gateway/archive/%s.tar.gz' % VERSION,
+    download_url='https://github.com/thingsboard/thingsboard-gateway/archive/%s.tar.gz' % version.VERSION,
     entry_points={
         'console_scripts': [
             'thingsboard-gateway = thingsboard_gateway.tb_gateway:daemon',

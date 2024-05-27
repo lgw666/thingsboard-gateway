@@ -15,14 +15,14 @@
 import os.path
 from logging import getLogger
 from logging.config import dictConfig
-from time import sleep, time
+from queue import Queue
+from threading import Thread
+from time import sleep, time, monotonic
 
-from packaging import version
 from regex import fullmatch
 from simplejson import dumps, load
 
 from thingsboard_gateway.gateway.tb_client import TBClient
-from thingsboard_gateway.tb_utility.tb_handler import TBLoggerHandler
 from thingsboard_gateway.tb_utility.tb_utility import TBUtility
 
 LOG = getLogger("service")
@@ -35,14 +35,14 @@ class RemoteConfigurator:
     }
 
     def __init__(self, gateway, config):
+        self._request_queue = Queue()
+        self.in_process = False
         self._gateway = gateway
         self._config = config
         self._load_connectors_configuration()
         self._logs_configuration = self._load_logs_configuration()
-        self.in_process = False
         self._active_connectors = []
         self._handlers = {
-            'general_configuration': self._handle_general_configuration_update,
             'storage_configuration': self._handle_storage_configuration_update,
             'grpc_configuration': self._handle_grpc_configuration_update,
             'logs_configuration': self._handle_logs_configuration_update,
@@ -55,12 +55,13 @@ class RemoteConfigurator:
         }
         self._max_backup_files_number = 10
 
-        self._remote_gateway_version = None
-        self._fetch_remote_gateway_version()
-
         # creating backups (general and connectors)
         self.create_configuration_file_backup(self._get_general_config_in_local_format(), "tb_gateway.json")
         self._create_connectors_backup()
+
+        self._requests_processing_thread = Thread(name='Remote Request Processing', target=self._process_config_request,
+                                                  daemon=True)
+        self._requests_processing_thread.start()
 
         LOG.info('Remote Configurator started')
 
@@ -95,59 +96,6 @@ class RemoteConfigurator:
             connector.pop('config_updated', None)
             connector.pop('config_file_path', None)
         return connectors
-
-    def _fetch_remote_gateway_version(self):
-        def callback(key, err):
-            if err is not None:
-                LOG.exception(err)
-            if key is None:
-                self._remote_gateway_version = '0.0'
-                return
-
-            try:
-                self._remote_gateway_version = key['client']['Version']
-            except KeyError:
-                self._remote_gateway_version = '0.0'
-                LOG.warning('Cannot fetch version number from server! Version number set to 0.0')
-
-        self._gateway.tb_client.client.request_attributes(client_keys=['Version'], callback=callback)
-
-    def _send_default_connectors_config(self):
-        """
-        If remote gateway version wasn't fetch (default set to '0.0'), remote configurator send all default
-        connectors configs.
-        """
-        from thingsboard_gateway.gateway.tb_gateway_service import DEFAULT_CONNECTORS
-
-        # remote gateway version fetching in __init__ method (_fetch_remote_gateway_version)
-        LOG.debug('Waiting for remote gateway version...')
-
-        try_count = 1
-        while not self._remote_gateway_version and try_count <= 3:
-            if self._gateway.stopped:
-                return
-            try_count += 1
-            sleep(1)
-
-        if self._remote_gateway_version is None:
-            self._remote_gateway_version = "0.0"
-
-        need_update_configs = (self._remote_gateway_version == "0.0"
-                               or version.parse(self._gateway.version.get('current_version', '0.0')) > version.parse(str(self._remote_gateway_version)))
-
-        if need_update_configs:
-            default_connectors_configs_folder_path = self._gateway.get_config_path() + 'default-configs/'
-
-            for (connector_type, _) in DEFAULT_CONNECTORS.items():
-                connector_filename = connector_type + '.json'
-                try:
-                    with open(default_connectors_configs_folder_path + connector_filename, 'r') as file:
-                        config = load(file)
-                        self._gateway.tb_client.client.send_attributes(
-                            {connector_type.upper() + '_DEFAULT_CONFIG': config})
-                        LOG.debug('Default config for %s connector sent.', connector_type)
-                except FileNotFoundError:
-                    LOG.error('Default config file for %s connector not found! Passing...', connector_type)
 
     def _get_active_connectors(self):
         return [connector['name'] for connector in self.connectors_configuration]
@@ -215,7 +163,6 @@ class RemoteConfigurator:
             'Version': self._gateway.version.get('current_version', '0.0')
         }
         self._gateway.tb_client.client.send_attributes(init_config_message)
-        self._send_default_connectors_config()
 
         # sending remote created connectors
         for connector in self.connectors_configuration:
@@ -246,31 +193,40 @@ class RemoteConfigurator:
             return {}
 
     def process_config_request(self, config):
-        if not self.in_process:
-            LOG.info('Configuration update request received.')
-            LOG.debug('Got config update request: %s', config)
+        self._request_queue.put(config)
 
-            self.in_process = True
+    def _process_config_request(self):
+        while not self._gateway.stopped:
+            if not self._request_queue.empty():
+                self.in_process = True
+                config = self._request_queue.get()
+                LOG.info('Configuration update request received.')
+                LOG.debug('Got config update request: %s', config)
 
-            try:
-                for attr_name in config.keys():
-                    if 'deleted' in attr_name:
-                        continue
+                try:
+                    if 'general_configuration' in config.keys():
+                        self._handle_general_configuration_update(config['general_configuration'])
+                        config.pop('general_configuration', None)
 
-                    request_config = config[attr_name]
-                    if not self._is_modified(attr_name, request_config):
-                        continue
+                    for attr_name in config.keys():
+                        if 'deleted' in attr_name:
+                            continue
 
-                    for (name, func) in self._handlers.items():
-                        if fullmatch(name, attr_name):
-                            func(request_config)
-                            break
-            except (KeyError, AttributeError) as e:
-                LOG.error('Unknown attribute update name (Available: %s), %r', ', '.join(self._handlers.keys()), exc_info=e)
-            finally:
+                        request_config = config[attr_name]
+                        if not self._is_modified(attr_name, request_config):
+                            continue
+
+                        for (name, func) in self._handlers.items():
+                            if fullmatch(name, attr_name):
+                                func(request_config)
+                                break
+                except (KeyError, AttributeError) as e:
+                    LOG.error('Unknown attribute update name (Available: %s), %r', ', '.join(self._handlers.keys()),
+                              exc_info=e)
+
                 self.in_process = False
-        else:
-            LOG.error("Remote configuration is already in processing")
+            else:
+                sleep(.2)
 
     # HANDLERS ---------------------------------------------------------------------------------------------------------
     def _handle_general_configuration_update(self, config):
@@ -423,8 +379,7 @@ class RemoteConfigurator:
         LOG.debug('Processing active connectors configuration update...')
 
         for connector_name in config:
-            if self._gateway.connectors_configs.get(connector_name) is None:
-                self._gateway._check_shared_attributes(shared_keys=[connector_name])
+            self._gateway._check_shared_attributes(shared_keys=[connector_name])
 
         has_changed = False
         for_deletion = []
@@ -456,6 +411,7 @@ class RemoteConfigurator:
             "id": "bee7caf1-fd37-4026-8782-d480915d4d1a"
             "type": "mqtt",
             "configuration": "mqtt.json",
+            "enableRemoteLogging": false,
             "logLevel": "INFO",
             "key?type=>grpc": "auto",
             "class?type=>custom": "",
@@ -470,22 +426,26 @@ class RemoteConfigurator:
         try:
             config_file_name = config['configuration']
 
-            identifier_parameter = 'id' if config.get('id') else 'name'
-            found_connectors = list(filter(lambda item: item[identifier_parameter] == config[identifier_parameter],
-                                           self.connectors_configuration))
+            identifier_parameter = 'id' if config.get('configurationJson', {}).get('id') else 'name'
+            found_connectors = list(filter(
+                lambda item: item[identifier_parameter] == config.get('configurationJson', {}).get(
+                    identifier_parameter) or config.get(identifier_parameter),
+                self.connectors_configuration))
 
-            if (config.get('configurationJson')
-                    and config.get('configurationJson').get('id') is None
+            if (config.get('configurationJson', {})
+                    and config.get('configurationJson', {}).get('id') is None
                     and len(found_connectors) > 0
                     and found_connectors[0].get('configurationJson') is not None
-                    and found_connectors[0].get('configurationJson').get('id') is not None):
+                    and found_connectors[0].get('configurationJson', {}).get('id') is not None):
                 connector_id = TBUtility.get_or_create_connector_id(found_connectors[0].get("configurationJson"))
             else:
                 connector_id = TBUtility.get_or_create_connector_id(config.get('configurationJson'))
+
             if not found_connectors:
                 connector_configuration = {'name': config['name'],
                                            'type': config['type'],
                                            'id': connector_id,
+                                           'enableRemoteLogging': config.get('enableRemoteLogging', False),
                                            'configuration': config_file_name}
                 if config.get('key'):
                     connector_configuration['key'] = config['key']
@@ -496,6 +456,7 @@ class RemoteConfigurator:
                 with open(self._gateway.get_config_path() + config_file_name, 'w') as file:
                     config['configurationJson'].update({'logLevel': config['logLevel'],
                                                         'name': config['name'],
+                                                        'enableRemoteLogging': config.get('enableRemoteLogging', False),
                                                         'id': connector_id})
                     self.create_configuration_file_backup(config, config_file_name)
                     file.writelines(dumps(config['configurationJson'], indent='  '))
@@ -526,10 +487,15 @@ class RemoteConfigurator:
                         or found_connector.get('type') != config['type']
                         or found_connector.get('class') != config.get('class')
                         or found_connector.get('key') != config.get('key')
-                        or found_connector.get('configurationJson', {}).get('logLevel') != config.get('logLevel')):
+                        or found_connector.get('configurationJson', {}).get('logLevel') != config.get('logLevel')
+                        or found_connector.get('enableRemoteLogging', False) != config.get('enableRemoteLogging',
+                                                                                           False)):
                     changed = True
-                    connector_configuration = {'name': config['name'], 'type': config['type'],
-                                               'id': connector_id, 'configuration': config_file_name}
+                    connector_configuration = {'name': config['name'],
+                                               'type': config['type'],
+                                               'id': connector_id,
+                                               'enableRemoteLogging': config.get('enableRemoteLogging', False),
+                                               'configuration': config_file_name}
 
                     if config.get('key'):
                         connector_configuration['key'] = config['key']
@@ -543,15 +509,33 @@ class RemoteConfigurator:
                     with open(self._gateway.get_config_path() + config_file_name, 'w') as file:
                         config['configurationJson'].update({'logLevel': config['logLevel'],
                                                             'name': config['name'],
+                                                            'enableRemoteLogging': config.get('enableRemoteLogging',
+                                                                                              False),
                                                             'id': connector_id})
                         file.writelines(dumps(config['configurationJson'], indent='  '))
 
                     if connector_configuration is None:
                         connector_configuration = found_connector
                     if connector_configuration.get('id') in self._gateway.available_connectors_by_id:
-                        self._gateway.available_connectors_by_id[connector_configuration['id']].close()
+                        try:
+                            close_start = monotonic()
+                            while not self._gateway.available_connectors_by_id[connector_configuration['id']].is_stopped():
+                                self._gateway.available_connectors_by_id[connector_configuration['id']].close()
+                                if monotonic() - close_start > 5:
+                                    LOG.error('Connector %s not stopped in 5 seconds', connector_configuration['id'])
+                                    break
+                        except Exception as e:
+                            LOG.exception("Exception on closing connector occurred:", exc_info=e)
                     elif connector_configuration.get('name') in self._gateway.available_connectors_by_name:
-                        self._gateway.available_connectors_by_name[connector_configuration['name']].close()
+                        try:
+                            close_start = monotonic()
+                            while not self._gateway.available_connectors_by_name[connector_configuration['name']].is_stopped():
+                                self._gateway.available_connectors_by_name[connector_configuration['name']].close()
+                                if monotonic() - close_start > 5:
+                                    LOG.error('Connector %s not stopped in 5 seconds', connector_configuration['name'])
+                                    break
+                        except Exception as e:
+                            LOG.exception("Exception on closing connector occurred:", exc_info=e)
                     else:
                         LOG.warning('Connector with id %s not found in available connectors', connector_configuration.get('id'))
                     if connector_configuration.get('id') in self._gateway.available_connectors_by_id:
@@ -566,11 +550,12 @@ class RemoteConfigurator:
                     self._gateway.load_connectors(self._get_general_config_in_local_format())
                     self._gateway.connect_with_connectors()
 
-            for device_name in list(self._gateway.get_devices().keys()):
-                for connector_id in self._gateway.available_connectors_by_id.keys():
-                    if (self._gateway.available_connectors_by_id.get(connector_id)
-                            and self._gateway.available_connectors_by_id[connector_id].get_id() == connector_id):
-                        self._gateway.update_device(device_name, "connector", self._gateway.available_connectors_by_id[connector_id])
+            for (device_name, device_config) in list(self._gateway.get_devices().items()):
+                if (connector_id == device_config.get('connector').get_id()
+                        and self._gateway.available_connectors_by_id.get(connector_id) is not None):
+                    self._gateway.update_device(device_name,
+                                                "connector",
+                                                self._gateway.available_connectors_by_id[connector_id])
 
             self._gateway.tb_client.client.send_attributes({config['name']: config})
         except Exception as e:
